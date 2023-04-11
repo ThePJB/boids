@@ -9,329 +9,7 @@ use cpal::traits::*;
 use ringbuf::*;
 use core::f32::consts::PI;
 
-
-// elf can slide through real cool like leaving the title behind him (etched into the ice)
-// lol imagine if i used the sprites for all kind of effects. could use them to make the checkered background
-// could use them to do pokie wheels
-
-// more and lazier snow,
-
-// if entity is moving on snow play snow move noise
-// if entity is sliding on ice continue playing ice slide noise.. hows that, high frequency popping/sizzling
-// try subtle randomization of sound properties
-
-// add more colour to the design
-// what if we had flags like world 1... level 1... coming down the sides
-// maybe a fancy border
-
-// undo juicings / hold to undo more
-// proper victory graphic
-// other levels + level menu
-// level transition
-
-// needs a directed graph level
-
-pub const TILE_SNOW: usize = 0;
-pub const TILE_WALL: usize = 1;
-pub const TILE_ICE: usize = 2;
-
-pub const ENT_PLAYER: usize = 0;
-pub const ENT_PRESENT: usize = 1;
-pub const ENT_TARGET: usize = 2;
-pub const ENT_CRATE: usize = 3;
-pub const ENT_NONE: usize = 4;
-
-pub const SLIDE_T: f64 = 0.11;
-pub const VICTORY_T: f64 = 0.5;
-
-pub struct CurrentLevel {
-    w: usize,
-    h: usize,
-    tiles: Vec<usize>,
-    static_ents: Vec<usize>,
-    moving_ents: Vec<usize>,
-    ent_move_x: Vec<i32>,
-    ent_move_y: Vec<i32>,
-    try_move_x: Vec<i32>,
-    try_move_y: Vec<i32>,
-    ent_dir_x: Vec<i32>,
-}
-
-pub struct HistoryEntry {
-    moving_ents: Vec<usize>,
-    ent_dir_x: Vec<i32>,
-    snow_t: f32,
-}
-
-impl CurrentLevel {
-    fn can_move(&self, i: usize, j: usize, dx: i32, dy: i32) -> bool {
-        if dx == 0 && dy == 0 { return false; }
-        let ni = (i as i32 + dx) as usize;
-        let nj = (j as i32 + dy) as usize;
-
-        self.tiles[nj*self.w + ni] != TILE_WALL && (self.moving_ents[nj*self.w + ni] == ENT_NONE || self.can_move(ni, nj, dx, dy))
-    }
-    fn push(&mut self, i: usize, j: usize, dx: i32, dy: i32) {
-        if dx == 0 && dy == 0 { return; }
-        let idx = j*self.w + i;
-        if self.moving_ents[idx] != ENT_NONE { return; }
-        let ni = (i as i32 + dx) as usize;
-        let nj = (j as i32 + dy) as usize;
-        let nidx = nj*self.w + ni;
-
-        if !self.can_move(i, j, dx, dy) { return; }
-        if self.moving_ents[nidx] == ENT_NONE { return; }
-        
-        self.try_move_x[nidx] = dx;
-        self.try_move_y[nidx] = dy;
-
-        self.push(ni, nj, dx, dy);
-    }
-    // sets move if entity with try_move can move
-    // try move needs to propagate if can move
-    // yea just try move propagation is annoying
-
-    fn set_try_move(&mut self, i: usize, j: usize, dx: i32, dy: i32) {
-        let idx = j*self.w+i;
-        if self.moving_ents[idx] == ENT_NONE { return; }
-        if dx == 0 && dy == 0 { return; }
-        self.try_move_x[idx] = dx;
-        self.try_move_y[idx] = dy;
-        let ni = (i as i32 + dx) as usize;
-        let nj = (j as i32 + dy) as usize;
-        self.set_try_move(ni, nj, dx, dy);
-    }
-
-    fn resolve_movement_attempts(&mut self) {
-        println!("resolve movt attempts");
-        for i in 0..self.w {
-            for j in 0..self.h {
-                let idx = j*self.w + i;
-                if self.moving_ents[idx] == ENT_NONE { continue; }
-                if self.try_move_x[idx] == 0 && self.try_move_y[idx] == 0 { continue; }
-                self.push(i, j, self.try_move_x[idx], self.try_move_y[idx]);
-            }
-        }
-
-        for i in 0..self.w {
-            for j in 0..self.h {
-                let idx = j*self.w + i;
-                if self.moving_ents[idx] == ENT_NONE { continue; }
-                if self.try_move_x[idx] == 0 && self.try_move_y[idx] == 0 { continue; }
-                if self.can_move(i, j, self.try_move_x[idx], self.try_move_y[idx]) {
-                    println!("setting move {} {}", i, j);
-                    self.ent_move_x[idx] = self.try_move_x[idx];
-                    if self.moving_ents[idx] == ENT_PLAYER && self.try_move_x[idx] != 0 {
-                        self.ent_dir_x[idx] = self.try_move_x[idx];
-                    }
-                    self.ent_move_y[idx] = self.try_move_y[idx];
-                } else {
-                    println!("canmove false at {} {}", i, j);
-                }
-            }
-        }
-    }
-
-    fn move_players(&mut self, dx: i32, dy: i32) {
-        for i in 0..self.w {
-            for j in 0..self.h {
-                if self.moving_ents[j*self.w+i] == ENT_PLAYER {
-                    self.set_try_move(i, j, dx, dy);
-                }
-            }
-        }
-        self.resolve_movement_attempts();
-    }
-    // needs to transform move into actual movement
-    // move is NEVER retained
-    // try move is ONLY retained if something gets moved to ice
-    fn apply_move(&mut self) {
-        let mut next_ents = vec![ENT_NONE; self.w*self.h];
-        let mut next_try_move_x = vec![0; self.w*self.h];
-        let mut next_try_move_y = vec![0; self.w*self.h];
-        let mut next_dir_x = vec![0; self.w*self.h];
-        for i in 0..self.w {
-            for j in 0..self.h {
-                if self.moving_ents[j*self.w+i] == ENT_NONE { continue; }
-                let ni = (i as i32 + self.ent_move_x[j*self.w+i]) as usize;
-                let nj = (j as i32 + self.ent_move_y[j*self.w+i]) as usize;
-                next_ents[nj*self.w + ni] = self.moving_ents[j*self.w+i];
-                next_dir_x[nj*self.w + ni] = self.ent_dir_x[j*self.w+i];
-                if self.tiles[nj*self.w + ni] == TILE_ICE && (self.ent_move_x[j*self.w+i] != 0 || self.ent_move_y[j*self.w+i] != 0) {
-                    next_try_move_x[nj*self.w + ni] = self.try_move_x[j*self.w+i];
-                    next_try_move_y[nj*self.w + ni] = self.try_move_y[j*self.w+i];
-                }
-            }
-        }
-        self.moving_ents = next_ents;
-        self.try_move_x = next_try_move_x;
-        self.try_move_y = next_try_move_y;
-        self.ent_move_x = vec![0; self.w*self.h];
-        self.ent_move_y = vec![0; self.w*self.h];
-        self.ent_dir_x = next_dir_x;
-        self.propagate_try_moves();
-    }
-    fn propagate_try_moves(&mut self) {
-        for i in 0..self.w {
-            for j in 0..self.h {
-                self.set_try_move(i, j, self.try_move_x[j*self.w+i], self.try_move_y[j*self.w+i])
-            }
-        }
-    }
-    fn can_move_any_player(&self, dx: i32, dy: i32) -> bool {
-        for i in 0..self.w {
-            for j in 0..self.h {
-                if self.moving_ents[j*self.w + i] == ENT_PLAYER {
-                    if self.can_move(i, j, dx, dy) {
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
-    }
-    fn any_try_move(&self) -> bool {
-        for idx in 0..self.try_move_x.len() {
-            if self.try_move_x[idx] != 0 || self.try_move_y[idx] != 0 {
-                return true;
-            }
-        }
-        return false;
-    }
-    fn remaining_presents(&self) -> usize {
-        let mut acc = 0;
-        for i in 0..self.w {
-            for j in 0..self.h {
-                if self.static_ents[j*self.w + i] == ENT_TARGET {
-                    if self.moving_ents[j*self.w + i] != ENT_PRESENT {
-                        acc += 1;
-                    }
-                }
-            }
-        }
-        acc
-    }
-}
-
-pub struct Level {
-    title: String,
-    tiles: Vec<usize>,
-    entities: Vec<(usize, usize, usize)>,
-    w: usize,
-    h: usize,
-}
-
-impl Level {
-    fn from(title: &str, contents: &str) -> Level {
-
-        let w = contents.split("\n").map(|x| x.trim()).filter(|x| x.len() > 0).nth(0).unwrap().len();
-        let h = contents.split("\n").map(|x| x.trim()).filter(|x| x.len() > 0).count();
-
-        let mut tiles = vec![0usize; w*h];
-        let mut entities = vec![];
-
-        let mut i;
-        let mut j = 0;
-
-        for row in contents.split("\n").map(|x| x.trim()).filter(|x| x.len() > 0) {
-            i = 0;
-            if row.len() != w {
-                dbg!(row.len(), w, row, i, j);
-                panic!("bad level");
-            }
-
-            for char in row.chars() {
-                match char {
-                    ' ' => tiles[j*w+i] = TILE_SNOW,
-                    '#' => tiles[j*w+i] = TILE_WALL,
-                    '/' => tiles[j*w+i] = TILE_ICE,
-                    'p' => {
-                        tiles[j*w+i] = 0;
-                        entities.push((i,j,ENT_PLAYER));
-                    },
-                    'P' => {
-                        tiles[j*w+i] = 2;
-                        entities.push((i,j,ENT_PLAYER));
-                    },
-                    'b' => {
-                        tiles[j*w+i] = 0;
-                        entities.push((i,j,ENT_PRESENT));
-                    },
-                    'B' => {
-                        tiles[j*w+i] = 2;
-                        entities.push((i,j,ENT_PRESENT));
-                    },
-                    'c' => {
-                        tiles[j*w+i] = 0;
-                        entities.push((i,j,ENT_CRATE));
-                    },
-                    'C' => {
-                        tiles[j*w+i] = 2;
-                        entities.push((i,j,ENT_CRATE));
-                    },
-                    't' => {
-                        tiles[j*w+i] = 0;
-                        entities.push((i,j,ENT_TARGET));
-                    },
-                    'T' => {
-                        tiles[j*w+i] = 2;
-                        entities.push((i,j,ENT_TARGET));
-                    },
-                    _ => {
-                        panic!("forbidden");
-                    }
-                }
-
-                i += 1;
-            }
-
-            j += 1;
-        }
-
-        let mut l = Level {
-            title: title.to_string(),
-            tiles,
-            entities,
-            w,
-            h,
-        };
-        l
-    }
-    fn to_current(&self) -> CurrentLevel {
-        let mut static_ents = vec![ENT_NONE; self.w*self.h];
-        let mut moving_ents = vec![ENT_NONE; self.w*self.h];
-
-        for idx in 0..self.entities.len() {
-            let (i, j, e) = self.entities[idx];
-            match e {
-                ENT_PLAYER => moving_ents[j*self.w+i] = ENT_PLAYER,
-                ENT_PRESENT => moving_ents[j*self.w+i] = ENT_PRESENT,
-                ENT_CRATE => moving_ents[j*self.w+i] = ENT_CRATE,
-                ENT_TARGET => static_ents[j*self.w+i] = ENT_TARGET,
-                _ => panic!("unknown entity"),
-            }
-        }
-        CurrentLevel {
-            w: self.w, 
-            h: self.h, 
-            tiles: self.tiles.clone(), 
-            static_ents, 
-            moving_ents, 
-            ent_move_x: vec![0; self.w*self.h], 
-            ent_move_y: vec![0; self.w*self.h],
-            ent_dir_x: vec![0; self.w*self.h],
-            try_move_x: vec![0; self.w*self.h],
-            try_move_y: vec![0; self.w*self.h],
-        }
-    }
-}
-
-
-// extreme dopamine mode: scores queue up and get loaded in
-// or if they replenish can you go infinite
-// maybe with time constraint
-
-// make the squares trippy fragment shader programs
+const PHI: f32 = 1.618033988749894;
 
 // ====================
 // Math
@@ -377,7 +55,59 @@ impl V2 {
     pub fn dot(&self, other: V2) -> f32 {
         self.x*other.x + self.y * other.y
     }
+    pub fn norm(&self) -> V2 {
+        let mag = self.dot(*self).sqrt();
+        v2(self.x/mag, self.y/mag)
+    }
 }
+impl std::ops::Sub<V2> for V2 {
+    type Output = V2;
+
+    fn sub(self, _rhs: V2) -> V2 {
+        V2 { x: self.x - _rhs.x, y: self.y - _rhs.y }
+    }
+}
+
+impl std::ops::Add<V2> for V2 {
+    type Output = V2;
+
+    fn add(self, _rhs: V2) -> V2 {
+        V2 { x: self.x + _rhs.x, y: self.y + _rhs.y }
+    }
+}
+
+impl std::ops::Mul<f32> for V2 {
+    type Output = V2;
+
+    fn mul(self, _rhs: f32) -> V2 {
+        v2(self.x*_rhs, self.y*_rhs)
+    }
+}
+
+impl std::ops::Mul<V2> for f32 {
+    type Output = V2;
+
+    fn mul(self, _rhs: V2) -> V2 {
+        v2(self*_rhs.x, self*_rhs.y)
+    }
+}
+
+impl std::ops::Div<f32> for V2 {
+    type Output = V2;
+
+    fn div(self, _rhs: f32) -> V2 {
+        v2(self.x/_rhs, self.y/_rhs)
+    }
+}
+
+impl std::ops::Neg for V2 {
+    type Output = V2;
+
+    fn neg(self) -> V2 {
+        v2(-self.x, -self.y)
+    }
+}
+
 impl V3 {
     pub fn dot(&self, other: V3) -> f32 {
         self.x*other.x + self.y * other.y + self.z*other.z
@@ -482,7 +212,34 @@ impl CTCanvas {
     }
     pub fn put_quad(&mut self, p1: V2, uv1: V2, p2: V2, uv2: V2, p3: V2, uv3: V2, p4: V2, uv4: V2, depth: f32, colour: V4, mode: u32) {
         self.put_triangle(p1, uv1, p2, uv2, p3, uv3, depth, colour, mode);
-        self.put_triangle(p4, uv4, p2, uv2, p3, uv3, depth, colour, mode);
+        // self.put_triangle(p4, uv4, p2, uv2, p3, uv3, depth, colour, mode);
+        self.put_triangle(p3, uv3, p4, uv4, p1, uv1, depth, colour, mode);
+    }
+    // verts go cw as do uvs
+    pub fn put_rotated_quad(&mut self, cx: f32, cy: f32, s: f32, r: f32, uv1: V2, uv2: V2, uv3: V2, uv4: V2, depth: f32, colour: V4, mode: u32) {
+        let mut xs = [0.0f32; 4];
+        let mut ys = [0.0f32; 4];
+
+        for idx in 0..4 {
+            // let theta = boids_r[i] + PI/8. + idx as f32 * PI/4.;
+            let theta = r + PI/4. + idx as f32 * PI/2.;
+            xs[idx] = cx + s.sqrt() * theta.cos();
+            ys[idx] = cy + s.sqrt() * theta.sin();
+        }
+        
+        self.put_quad(
+            v2(xs[0],ys[0]),
+            v2(1., 0.),
+            v2(xs[1],ys[1]),
+            v2(1., 1.),
+            v2(xs[2],ys[2]),
+            v2(0., 1.),
+            v2(xs[3],ys[3]),
+            v2(0., 0.),
+            -0.2,
+            colour,
+            3
+        );
     }
 
     pub fn put_rect(&mut self, r: V4, r_uv: V4, depth: f32, colour: V4, mode: u32) {
@@ -697,9 +454,10 @@ where
 
 fn main() {
     unsafe {
+        
         let mut xres = 1600i32;
         let mut yres = 1600i32;
-
+        
         // ====================
         // Sound Init
         // ====================
@@ -710,7 +468,7 @@ fn main() {
 
         let event_loop = glutin::event_loop::EventLoop::new();
         let window_builder = glutin::window::WindowBuilder::new()
-                .with_title("Snowkoban")
+                .with_title("Boids")
                 .with_inner_size(glutin::dpi::PhysicalSize::new(xres, yres));
 
         let window = glutin::ContextBuilder::new()
@@ -728,6 +486,7 @@ fn main() {
         gl.enable(DEPTH_TEST);
         // gl.enable(CULL_FACE);
         gl.blend_func(SRC_ALPHA, ONE_MINUS_SRC_ALPHA);
+        gl.depth_func(LEQUAL);
         gl.enable(BLEND);
         // gl.debug_message_callback(|a, b, c, d, msg| {
         //     println!("{} {} {} {} msg: {}", a, b, c, d, msg);
@@ -802,48 +561,46 @@ fn main() {
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
         gl.generate_mipmap(glow::TEXTURE_2D);
 
-
-
-
-
         // ====================
         // Simulation
         // ====================
-        let worlds: Vec<(&str, Vec<Level>)> = vec![
-            ("world1",vec![
-                Level::from("ice to meet you", include_str!("levels/world2/1.lvl")),
-                Level::from("wasd to move", include_str!("levels/world1/0.lvl")),
-                Level::from("z to undo", include_str!("levels/world1/1.lvl")),
-                Level::from("failure is the key to success", include_str!("levels/world1/2.lvl")),
-                Level::from("greed test", include_str!("levels/world1/4.lvl")),
-                Level::from("get around it", include_str!("levels/world1/3.lvl")),
-            ]),
-            ("world2",vec![
-                Level::from("ice to meet you", include_str!("levels/world2/1.lvl")),
-                Level::from("blocking", include_str!("levels/world2/2.lvl")),
-                Level::from("dont get stuck on this one", include_str!("levels/world2/3.lvl")),
-            ]),
-        ];
 
-        let mut curr_world_num = 0;
-        let mut curr_level_num = 0;
+        // now this is something I can test permuting on
+
+        let mut n_boids = 0;
+        let mut boids_x: Vec<f32> = vec![];
+        let mut boids_y: Vec<f32> = vec![];
+        let mut boids_vx: Vec<f32> = vec![];
+        let mut boids_vy: Vec<f32> = vec![];
+
+        let max_speed = 0.25;
+        let min_speed = 0.15;
+
+        let amt_cohesion = 0.01;
+        let amt_align = 0.5;
+        let amt_separate = 1.0;
+
+        let d_cohesion = 0.1;
+        let d_align = 0.1;
+        let d_separate = 0.05;
+
+        let boid_s = 0.0002;
+
+        for i in 0..1600 {
+            let si = khash(i*12371247 + 1231517);
+
+            let r = krand(si * 23481347)*2.0*PI;
+
+            boids_x.push(krand(si * 12831237)*2.0 - 1.0);
+            boids_y.push(krand(si * 23124317)*2.0 - 1.0);
+            boids_vx.push(r.cos()*min_speed);
+            boids_vy.push(r.sin()*min_speed);
+            n_boids += 1;
+        }
 
         let mut t = 0.0;
-        let mut snow_t = 0.0;
-        let mut t_move = 0.0;
         let mut t_last = Instant::now();
         let mut mouse_pos = v2(0., 0.);
-
-        let mut animating = false;
-        let mut victory = false;
-        let mut buffered_dx = 0;
-        let mut buffered_dy = 0;
-
-        let mut curr_level = worlds[curr_world_num].1[curr_level_num].to_current();
-
-        let mut history: Vec<HistoryEntry> = Vec::new();
-
-        let mut menu = false;
 
         event_loop.run(move |event, _, _| {
 
@@ -869,70 +626,24 @@ fn main() {
                         WindowEvent::KeyboardInput {input, ..} => {
                             match input {
                                 glutin::event::KeyboardInput {virtual_keycode: Some(code), state: ElementState::Released, ..} => {
-                                    if victory && t - t_move > VICTORY_T {
-                                        curr_level_num += 1;
-                                        if curr_level_num == worlds[curr_world_num].1.len() {
-                                            curr_level_num = 0;
-                                            if curr_world_num != worlds.len() - 1 {
-                                                curr_world_num += 1;
-                                            }
-                                            menu = true;
-                                        }
-                                        dbg!(curr_world_num, curr_level_num);
-                                        curr_level = worlds[curr_world_num].1[curr_level_num].to_current();
-                                        victory = false;
-                                        buffered_dx = 0;
-                                        buffered_dy = 0;
-                                        animating = false;
-                                        history = vec![];
-                                        return;
-                                    }
                                     match code {
-                                        VirtualKeyCode::Escape => {
-                                        },
-                                        VirtualKeyCode::M => {
-                                            victory = true
-                                        },
-                                        VirtualKeyCode::W | VirtualKeyCode::Up |
-                                        VirtualKeyCode::S | VirtualKeyCode::Down |
-                                        VirtualKeyCode::A | VirtualKeyCode::Left |
-                                        VirtualKeyCode::D | VirtualKeyCode::Right => {
-                                            let (dx, dy) = match code {
-                                                VirtualKeyCode::W | VirtualKeyCode::Up => (0, -1),
-                                                VirtualKeyCode::S | VirtualKeyCode::Down => (0, 1),
-                                                VirtualKeyCode::A | VirtualKeyCode::Left => (-1, 0),
-                                                VirtualKeyCode::D | VirtualKeyCode::Right =>(1, 0),
-                                                _ => panic!("unreachable"),
-                                            };
-                                            if animating {
-                                                buffered_dx = dx;
-                                                buffered_dy = dy;
-                                            } else if !victory {
-                                                curr_level.move_players(dx, dy);
-                                                t_move = t;
-                                                animating = true;
-                                                if curr_level.can_move_any_player(dx, dy) {
-                                                    history.push(HistoryEntry {
-                                                        moving_ents: curr_level.moving_ents.clone(),
-                                                        ent_dir_x: curr_level.ent_dir_x.clone(),
-                                                        snow_t,
-                                                    });
-                                                    
-                                                    prod.push(Sound { id: 1, birthtime: t as f32, elapsed: 0.0, remaining: 0.1, magnitude: 0.1, mag_exp: 0.999, frequency: 440.0, freq_exp: 1.0, wait: 0.0, phase: 0.0 }).unwrap();
-                                                } else {
-                                                    prod.push(Sound { id: 1, birthtime: t as f32, elapsed: 0.0, remaining: 0.1, magnitude: 0.1, mag_exp: 0.999, frequency: 220.0, freq_exp: 0.999, wait: 0.0, phase: 0.0 }).unwrap();
-                                                }
-                                            }
-                                        },
-
-                                        VirtualKeyCode::Z => {
-                                            if !victory && !animating {
-                                                if let Some(he) = history.pop() {
-                                                    curr_level.moving_ents = he.moving_ents;
-                                                    curr_level.ent_dir_x = he.ent_dir_x;
-                                                    snow_t = he.snow_t;
-                                                    prod.push(Sound { id: 1, birthtime: t as f32, elapsed: 0.0, remaining: 0.2, magnitude: 0.1, mag_exp: 0.9999, frequency: 100.0, freq_exp: 1.0002, wait: 0.0, phase: 0.0 }).unwrap();
-                                                }
+                                        VirtualKeyCode::R => {
+                                            n_boids = 0;
+                                            boids_x = vec![];
+                                            boids_y = vec![];
+                                            boids_vx = vec![];
+                                            boids_vy = vec![];
+                                            for i in 0..1600 {
+                                                let si = khash(i*12371247 + 1231517);
+                                                let si = khash(si);
+                                    
+                                                let r = krand(si * 23481347)*2.0*PI;
+                                    
+                                                boids_x.push(krand(si * 12831237)*2.0 - 1.0);
+                                                boids_y.push(krand(si * 23124317)*2.0 - 1.0);
+                                                boids_vx.push(r.cos()*min_speed);
+                                                boids_vy.push(r.sin()*min_speed);
+                                                n_boids += 1;
                                             }
                                         },
                                         _ => {},
@@ -949,197 +660,101 @@ fn main() {
                     let t_now = Instant::now();
                     let dt = (t_now - t_last).as_secs_f64();
                     t += dt;
-                    snow_t += dt as f32;
                     t_last = t_now;
 
                     let mut canvas = CTCanvas::new();
 
-                    let w = curr_level.w;
-                    let h = curr_level.h;
 
-                    let screen_rect = v4(-1., -1., 2., 2.);
-                    let aspect = xres as f32 / yres as f32;
-                    let level_aspect = w as f32 / h as f32;
+                    // the question about velocity is do we retain velocity?
+                    // i think yes
 
-                    let lvlw = (2.0*level_aspect/aspect).min(2.0);
-                    let lvlh = (2.0*aspect/level_aspect).min(2.0);
-                    let xo = (2.0 - lvlw)/2.0;
-                    let yo = (2.0 - lvlh)/2.0;
-                    let lvlx = -1. + xo;
-                    let lvly = -1. + yo;
+                    // just need to give them velocity and stuff
+                    // and implement boids algorithm
 
-                    let level_rect = v4(lvlx, lvly, lvlw, lvlh);
 
-                    if t - t_move > SLIDE_T {
-                        let n_pres = curr_level.remaining_presents();
-                        curr_level.apply_move();
-                        let n_pres2 = curr_level.remaining_presents();
-                        if n_pres2 < n_pres {
-                            prod.push(Sound { id: 1, birthtime: t as f32, elapsed: 0.0, remaining: 0.1, magnitude: 0.1, mag_exp: 0.999, frequency: 440.0 * 3./2., freq_exp: 1.0, wait: 0.0, phase: 0.0 }).unwrap();
-                            if n_pres2 == 0 {
-                                prod.push(Sound { id: 1, birthtime: t as f32, elapsed: 0.0, remaining: 0.1, magnitude: 0.1, mag_exp: 0.999, frequency: 440.0 * 2., freq_exp: 1.0, wait: SLIDE_T as f32, phase: 0.0 }).unwrap();
+
+                    for i in 0..n_boids {
+                        // update on neighbours
+                        let mut n_acc = 0;
+                        let mut rx_acc = 0.0;
+                        let mut ry_acc = 0.0;
+                        let mut s_acc = 0.0;
+
+                        // yea and if it could be weighted on distance
+                        // theres other stuff too like avoid
+
+                        // the hard limit probably makes it more chaotic, prone to splitting flocks etc.
+                        // not only does big flock eat small flock but it attains black hole density
+
+                        for j in 0..n_boids {
+                            if i == j { continue; }
+                            let dx = boids_x[i]-boids_x[j];
+                            let dy = boids_y[i]-boids_y[j];
+                            let d = (dx*dx+dy*dy).sqrt();
+
+                            if d < d_align {
+                                let w = (d_align - d) / d_align;
+                                boids_vx[i] = lerp(boids_vx[i], boids_vx[j], w*amt_align*dt as f32);
+                                boids_vy[i] = lerp(boids_vy[i], boids_vy[j], w*amt_align*dt as f32);
                             }
-                        }
-                        if n_pres2 > n_pres {
-                            prod.push(Sound { id: 1, birthtime: t as f32, elapsed: 0.0, remaining: 0.1, magnitude: 0.1, mag_exp: 0.999, frequency: 440.0 / (3./2.), freq_exp: 1.0, wait: 0.0, phase: 0.0 }).unwrap();
-                        }
-                        if curr_level.any_try_move() {
-                            dbg!("any try move true");
-                            t_move = t;
-                            curr_level.resolve_movement_attempts();
-                        } else {
-                            if buffered_dx != 0 || buffered_dy != 0 && !victory {
-                                if curr_level.can_move_any_player(buffered_dx, buffered_dy) {
-                                    animating = true;
-                                    t_move = t;
-                                    history.push(HistoryEntry {
-                                        moving_ents: curr_level.moving_ents.clone(),
-                                        ent_dir_x: curr_level.ent_dir_x.clone(),
-                                        snow_t,
-                                    });
-                                    curr_level.move_players(buffered_dx, buffered_dy);
-
-                                    prod.push(Sound { id: 1, birthtime: t as f32, elapsed: 0.0, remaining: 0.1, magnitude: 0.1, mag_exp: 0.999, frequency: 440.0, freq_exp: 1.0, wait: 0.0, phase: 0.0 }).unwrap();
-                                } else {
-                                    prod.push(Sound { id: 1, birthtime: t as f32, elapsed: 0.0, remaining: 0.1, magnitude: 0.1, mag_exp: 0.999, frequency: 220.0, freq_exp: 0.999, wait: 0.0, phase: 0.0 }).unwrap();
-                                }
-                                buffered_dx = 0;
-                                buffered_dy = 0;
-                            } else {
-                                animating = false;
+                            if d < d_separate {
+                                // maybe should be additionally normalized for the separation distance
+                                let dx = boids_x[i] - boids_x[j];
+                                let dy = boids_y[i] - boids_y[j];
+                                let v = v2(dx, dy);
+                                let correct = (v.norm()*d_separate - v)/d_separate;
+                                boids_vx[i] += correct.x*amt_separate*dt as f32;
+                                boids_vy[i] += correct.y*amt_separate*dt as f32;
+                            } else if d < d_cohesion {
+                                boids_vx[i] -= dx*amt_cohesion*dt as f32;
+                                boids_vy[i] -= dy*amt_cohesion*dt as f32;
                             }
+
                         }
-                    }
 
+                        // move
+                        boids_x[i] += boids_vx[i]*dt as f32;
+                        boids_y[i] += boids_vy[i]*dt as f32;
 
+                        let boundary = 0.7;
+                        let correct_strength = 1.5;
 
-                    // sliding: for undos whole slides need to be accounted for
-                    // but whether something loses its aspiration to move
-
-                    if curr_level.remaining_presents() == 0 &&!victory {
-                        victory = true;
-                        animating = true;
-                    }
-
-
-                    // canvas.put_rect(screen_rect, v4(0., 0., 1., 1.), 0.9, v4(0.2, 0.2, 0.2, 1.0), 0);
-                    canvas.put_rect(screen_rect, v4(0., 0., 1., 1.), 0.9, v4(0.2, 0.2, 0.2, 1.0), 0);
-                    canvas.put_rect(level_rect, v4(0., 0., 1., 1.), 0.0, v4(0.7, 0.2, 0.6, 1.0), 0);
-
-                    // computation of UVs for drawing of background out of wall sprite
-                    let tw = lvlw/w as f32;
-                    let th = lvlh/h as f32;
-                    let nw = (screen_rect.z / tw).ceil() + 1.;
-                    let nh = (screen_rect.w / th).ceil() + 1.;
-
-                    let xstart = xo - (xo/tw).ceil()*tw - 1.;
-                    let ystart = yo - (yo/th).ceil()*th - 1.;
-
-                    // background wall texture
-                    for i in 0..nw as usize {
-                        for j in 0..nh as usize {
-                            let x = xstart + i as f32 * tw;
-                            let y = ystart + j as f32 * th;
-                            canvas.put_sprite(0, v4(x, y, tw, th), 0.8, v4(1., 1., 1., 1.));
+                        if boids_x[i] < -boundary {
+                            boids_vx[i] += correct_strength*dt as f32;
                         }
-                    }
-
-                    // tiles
-                    for i in 0..w {
-                        for j in 0..h {
-                            let sprite = match curr_level.tiles[j*w + i] {
-                                TILE_WALL => 0,
-                                TILE_SNOW => 1,
-                                TILE_ICE => 2,
-                                _ => continue,
-                            };
-
-                            let r = level_rect.grid_child(i, j, w, h);
-
-                            canvas.put_sprite(sprite, r, -0.1, v4(1., 1., 1., 1.));
+                        if boids_x[i] > boundary {
+                            boids_vx[i] -= correct_strength*dt as f32;
                         }
-                    }
-
-                    // entities
-                    for i in 0..curr_level.w {
-                        for j in 0..curr_level.h {
-                            if curr_level.static_ents[j*curr_level.w+i] != ENT_TARGET { continue; }
-                            let r = level_rect.grid_child(i, j, w, h);
-                            canvas.put_sprite(6, r, -0.19, v4(1., 1., 1., 1.));
+                        if boids_y[i] < -boundary {
+                            boids_vy[i] += correct_strength*dt as f32;
                         }
-                    }
-
-                    for i in 0..curr_level.w {
-                        for j in 0..curr_level.h {
-                            let idx = j*curr_level.w+i;
-                            let sprite = match curr_level.moving_ents[idx] {
-                                ENT_PLAYER => if t % 1.0 > 0.5 {
-                                    4 
-                                } else {
-                                    5
-                                },
-                                ENT_CRATE => 7,
-                                ENT_PRESENT => 9,
-                                _ => continue,
-                            };
-                            let mut r = level_rect.grid_child(i, j, w, h);
-                            let mut x_shift = curr_level.ent_move_x[idx] as f32 * r.w * ((t - t_move)/SLIDE_T) as f32;
-                            let mut y_shift = curr_level.ent_move_y[idx] as f32 * r.z * ((t - t_move)/SLIDE_T) as f32;
-                            if x_shift == 0.0 && y_shift == 0.0 {
-                                let tt = ((t - t_move)/SLIDE_T) as f32;
-                                let ss = 1./16. * 2.0 * (0.5 - (tt - 0.5).abs());
-                                x_shift = curr_level.try_move_x[idx] as f32 * r.w * ss;
-                                y_shift = curr_level.try_move_y[idx] as f32 * r.z * ss;
-                            }
-                            r.x += x_shift;
-                            r.y += y_shift;
-
-                            let mut colour = v4(1., 1., 1., 1.);
-                            // if curr_level.try_move_x[idx] != 0 || curr_level.try_move_y[idx] != 0 {
-                            //     colour = v4(0., 1., 0., 1.);
-                            // }
-                            // if curr_level.ent_move_x[idx] != 0 || curr_level.ent_move_y[idx] != 0 {
-                            //     colour = v4(0., 0., 1., 1.);
-                            // }
-
-                            if curr_level.moving_ents[idx] == ENT_PLAYER && curr_level.ent_dir_x[idx] >= 0 {
-                                canvas.put_sprite_flipx(sprite, r, -0.2, colour);
-                            } else {
-                                canvas.put_sprite(sprite, r, -0.2, colour);
-                            };
+                        if boids_y[i] > boundary {
+                            boids_vy[i] -= correct_strength*dt as f32;
                         }
-                    }
 
-                    // ok how we drawin that snow
-                    // gotta transform it to be not stretched also
-                    let num_cols = 60.0 * aspect;
-                    for i in 0..num_cols.floor() as usize + 10 {
-                        let col_x = 2.0 * i as f32 / num_cols as f32;
-                        let col_seed = khash(i + 12312947);
-                        let phase = (krand(col_seed) + 0.05*snow_t as f32) % 1.0;
-                        let y = phase * 2.5 - 1.5;
-                        let x = (col_x + phase * 0.05 + 0.07*(10.0 * phase + 2.0*PI*krand(col_seed+1238124517)).sin()) * 2.0 - 1.5;
-                        let r = v4(x, y, 0.03/aspect, 0.03);
-                        canvas.put_rect(r.grid_child(1, 0, 3, 3), v4(0., 0., 1., 1.), -0.3, v4(1., 1., 1., 1.), 0);
-                        canvas.put_rect(r.grid_child(1, 2, 3, 3), v4(0., 0., 1., 1.), -0.3, v4(1., 1., 1., 1.), 0);
-                        canvas.put_rect(r.grid_child(0, 1, 3, 3), v4(0., 0., 1., 1.), -0.3, v4(1., 1., 1., 1.), 0);
-                        canvas.put_rect(r.grid_child(2, 1, 3, 3), v4(0., 0., 1., 1.), -0.3, v4(1., 1., 1., 1.), 0);
-                    }
+                        let mut vmag = (boids_vx[i]*boids_vx[i] + boids_vy[i]*boids_vy[i]).sqrt();
+                        if vmag > max_speed {
+                            boids_vx[i] = boids_vx[i]/vmag * max_speed;
+                            boids_vy[i] = boids_vy[i]/vmag * max_speed;
+                            vmag = max_speed;
+                        } else if vmag < min_speed {
+                            boids_vx[i] = boids_vx[i]/vmag * min_speed;
+                            boids_vy[i] = boids_vy[i]/vmag * min_speed;
+                            vmag = min_speed;
+                        }
 
-                    // print level name
-                    canvas.put_string_left(&worlds[curr_world_num].1[curr_level_num].title, -1., 1. - 0.06, 0.06*14./16.*yres as f32/xres as f32, 0.06, -0.4, v4(1., 1., 1., 1.));
 
-                    // string may need to be * aspect
-
-                    // demonstrate victory
-                    // unfurling banner where victory fades in
-                    if victory {
-                        canvas.put_string_centered("victory", 0.0, 0.0, 0.1*14./16.*yres as f32/xres as f32, 0.1, -0.4, v4(1., 1., 1., 1.,));
+                        // draw
+                        let r = (boids_vy[i]/vmag).atan2(boids_vx[i]/vmag);
+                        let colour = v4((i as f32 * PHI) % (360.0), 1.0, 1.0, 1.0).hsv_to_rgb();
+                        // let colour = v4(0., 0., 1., 1.);
+                        // let r = PI/2.0;
+                        canvas.put_rotated_quad(boids_x[i], boids_y[i], boid_s, r, v2(1., 0.), v2(0., 0.), v2(0., 1.), v2(1., 1.), -0.2, colour, 0);
                     }
 
                     gl.uniform_1_f32(gl.get_uniform_location(program, "time").as_ref(), t as f32);
 
-                    gl.clear_color(0.5, 0.5, 0.5, 1.0);
+                    gl.clear_color(0.1, 0.1, 0.1, 1.0);
                     gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT); 
                     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                     gl.use_program(Some(program));

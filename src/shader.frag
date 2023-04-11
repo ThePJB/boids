@@ -124,6 +124,24 @@ void main() {
           frag_colour = vec4(0.55, 0.55, 0.9, 1.0);
         }
         break;
+        case 3u:
+
+        //diamondy front and back
+        frag_colour = colour;
+        if (uv.y < 0.7) {
+          frag_colour = colour;
+          // if (uv.x < 1.4*uv.y + 0.7) {
+          //   frag_colour = vec4(0,0,1,1);  
+          // }
+        } else {
+          frag_colour = colour;
+        }
+        if (uv.x < 0.2 || uv.x > 0.8) {
+          frag_colour = vec4(0, 0, 0, 0);
+        }
+        // frag_colour = vec4(uv.x, uv.y, 0, 1);
+
+        break;
         case 1001u:
         // or if the geometry, it actually splits into 4 and they swap places, or flip and flip UVs
         // for transition diamonds shrink revealing next thing
